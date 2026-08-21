@@ -252,7 +252,7 @@ def find_robots_and_favicon():
 # ---------------------------------------------------------------------------
 WIX_MEDIA_RE = re.compile(
     r"https?://(?:static\.wixstatic\.com|video\.wixstatic\.com)"
-    r"/media/([A-Za-z0-9_%.~\-]+?)~mv2"
+    r"/media/([A-Za-z0-9_%.~\-]+?)(?:~mv2|%7[Ee]mv2)"
     r"(?:_d_[0-9]+_[0-9]+(?:_s_[0-9]+(?:_[0-9]+)?)?)?"
     r"\.([A-Za-z0-9]+)"
     r"(/v1/[^\"'\s)]*)?",
@@ -490,6 +490,7 @@ def build():
 
     write_sitemap(pages, page_meta)
     write_llms_txt(pages, page_meta)
+    write_headers_file()
     log("Done. Output written to ./site")
 
 
@@ -497,6 +498,44 @@ def write_robots(pages):
     with open(os.path.join(OUT_DIR, "robots.txt"), "w", encoding="utf-8") as f:
         f.write("User-agent: *\nAllow: /\n\nSitemap: "
                 f"{SITE_ORIGIN}/sitemap.xml\n")
+
+
+def write_headers_file():
+    """Cloudflare Pages reads a _headers file at the site root natively.
+
+    The archive has no legitimate JavaScript at all (Wix's runtime JS was
+    stripped during rewriting) and only two live third-party iframes
+    (Google Maps / YouTube embeds in a couple of posts) - everything else
+    that looks like a third-party widget (Wix chat, a comments plugin, a
+    PayPal button, a "back to top" widget) is inert `data-src` markup left
+    over from the original Wix export, since no script exists to promote it
+    to a real `src`. This CSP makes that permanent: it blocks all script
+    execution and restricts frames to just Google/YouTube, so none of that
+    dormant markup can ever become live again.
+    """
+    csp = (
+        "default-src 'none'; "
+        # static.wixstatic.com is allowed as a fallback for the ~300 images
+        # that were never archived by the Wayback Machine and so still
+        # point at Wix's (still-operating) CDN instead of a local copy.
+        "img-src 'self' data: https://static.wixstatic.com; "
+        "style-src 'self' 'unsafe-inline'; "
+        "font-src 'self' data: https://static.parastorage.com "
+        "https://fonts.gstatic.com; "
+        "frame-src https://www.google.com https://www.youtube.com "
+        "https://www.youtube-nocookie.com; "
+        "base-uri 'none'; "
+        "form-action 'none'"
+    )
+    lines = [
+        "/*",
+        "  X-Content-Type-Options: nosniff",
+        "  X-Frame-Options: SAMEORIGIN",
+        "  Referrer-Policy: strict-origin-when-cross-origin",
+        f"  Content-Security-Policy: {csp}",
+    ]
+    with open(os.path.join(OUT_DIR, "_headers"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def write_sitemap(pages, page_meta):
