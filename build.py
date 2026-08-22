@@ -951,13 +951,22 @@ def write_headers_file():
         # static.wixstatic.com is allowed as a fallback for the ~300 images
         # that were never archived by the Wayback Machine and so still
         # point at Wix's (still-operating) CDN instead of a local copy.
-        "img-src 'self' data: https://static.wixstatic.com; "
-        "style-src 'self' 'unsafe-inline'; "
+        # static.parastorage.com also serves the blog's social-share icons
+        # and assorted UI sprites (gallery arrows and the like).
+        "img-src 'self' data: https://static.wixstatic.com "
+        "https://static.parastorage.com; "
+        # The site links a Google Fonts stylesheet covering ~40 families,
+        # plus Wix's own languages.css. Blocking those left most text in a
+        # fallback face.
+        "style-src 'self' 'unsafe-inline' https://static.parastorage.com "
+        "https://fonts.googleapis.com; "
         # static.wixstatic.com/ufonts/ serves the site's custom uploaded
         # fonts; without it headings fall back to a generic serif.
         "font-src 'self' data: https://static.parastorage.com "
         "https://fonts.gstatic.com https://static.wixstatic.com; "
-        "frame-src https://www.google.com https://www.youtube.com "
+        # 'self' covers the locally saved Google Maps embed wrapper in
+        # assets/files/, which is framed from the same origin.
+        "frame-src 'self' https://www.google.com https://www.youtube.com "
         "https://www.youtube-nocookie.com; "
         "base-uri 'none'; "
         "form-action 'none'"

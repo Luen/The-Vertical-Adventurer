@@ -2,7 +2,7 @@
   X-Content-Type-Options: nosniff
   X-Frame-Options: SAMEORIGIN
   Referrer-Policy: strict-origin-when-cross-origin
-  Content-Security-Policy: default-src 'none'; img-src 'self' data: https://static.wixstatic.com; style-src 'self' 'unsafe-inline'; font-src 'self' data: https://static.parastorage.com https://fonts.gstatic.com https://static.wixstatic.com; frame-src https://www.google.com https://www.youtube.com https://www.youtube-nocookie.com; base-uri 'none'; form-action 'none'
+  Content-Security-Policy: default-src 'none'; img-src 'self' data: https://static.wixstatic.com https://static.parastorage.com; style-src 'self' 'unsafe-inline' https://static.parastorage.com https://fonts.googleapis.com; font-src 'self' data: https://static.parastorage.com https://fonts.gstatic.com https://static.wixstatic.com; frame-src 'self' https://www.google.com https://www.youtube.com https://www.youtube-nocookie.com; base-uri 'none'; form-action 'none'
 
 /blog/tags/*
   X-Robots-Tag: noindex, follow
