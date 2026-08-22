@@ -388,6 +388,116 @@ WAYBACK_BANNER_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 NOSCRIPT_RE = re.compile(r"<noscript\b[^>]*>.*?</noscript>", re.IGNORECASE | re.DOTALL)
+# Internal links are rewritten only inside real href/src attributes. An
+# earlier version matched any quoted run beginning with "/", which also
+# matched the "/" starting a self-closing tag - so markup like
+#   <img alt="x"/></a></li><li id="y"
+# was read as a URL and replaced wholesale, destroying the tags between.
+# Excluding <, > and whitespace from the value keeps a match inside one
+# attribute.
+LINK_ATTR_RE = re.compile(
+    r'(?P<pre>\b(?:href|src)\s*=\s*)(?P<q>["\'])(?P<url>[^"\'<>\s]*)(?P=q)',
+    re.IGNORECASE,
+)
+# Wix's runtime JS is stripped, so these preload hints only trigger
+# fetches for scripts that can never run (~39 per page, all CSP-blocked).
+PRELOAD_SCRIPT_RE = re.compile(
+    r'<link\b[^>]*\bas=["\']script["\'][^>]*>', re.IGNORECASE
+)
+BASE_TAG_RE = re.compile(r"<base\b[^>]*>", re.IGNORECASE)
+BODY_TAG_RE = re.compile(r"<body\b(?P<attrs>[^>]*)>", re.IGNORECASE)
+# Wix also ships the structural page wrappers with an inline
+# visibility:hidden and reveals them from JS once hydrated. Only these
+# wrappers are unhidden: visibility inherits, so descendants carrying
+# their own visibility:hidden stay hidden - which is what we want for the
+# dead PayPal button, chat widget, back-to-top, nav dropdowns and the
+# offscreen font-measuring rulers.
+PREHYDRATE_CONTAINER_RE = re.compile(
+    r'<(?:div|main)\b[^>]*?'
+    r'(?:id="(?:masterPage|SITE_ROOT|PAGES_CONTAINER|SITE_CONTAINER)"'
+    r'|data-is-mesh-layout=)'
+    r'[^>]*>',
+    re.IGNORECASE,
+)
+INLINE_HIDDEN_RE = re.compile(r"visibility\s*:\s*hidden\s*;?", re.IGNORECASE)
+
+
+def reveal_page_containers(text):
+    return PREHYDRATE_CONTAINER_RE.sub(
+        lambda m: INLINE_HIDDEN_RE.sub("", m.group(0)), text
+    )
+
+
+def hydrate_body_tag(text):
+    """Mark the page hydrated, as Wix's stripped runtime JS would.
+
+    Wix hides content until its JS has booted, via
+        body:not([data-js-loaded]) [data-hide-prejs] {visibility:hidden}
+    and by removing the prewarmup/warmup classes from <body> once loaded.
+    That JS is stripped here, so the attribute was never set and every
+    blog post body stayed invisible - fully laid out, just not painted.
+    Setting it at build time is what the runtime would have done, and is
+    safer than force-overriding visibility, which would also reveal
+    genuinely hidden UI (tooltips, dropdowns, unsent-form messages).
+    """
+    def _sub(m):
+        attrs = m.group("attrs")
+
+        def _strip_warmup(cm):
+            kept = [c for c in cm.group(2).split()
+                    if c.lower() not in ("prewarmup", "warmup")]
+            return f'class={cm.group(1)}{" ".join(kept)}{cm.group(1)}'
+
+        attrs = re.sub(r'class=(["\'])(.*?)\1', _strip_warmup, attrs,
+                       flags=re.IGNORECASE | re.DOTALL)
+        if "data-js-loaded" not in attrs.lower():
+            attrs = attrs.rstrip() + " data-js-loaded"
+        return f"<body{attrs}>"
+
+    return BODY_TAG_RE.sub(_sub, text, count=1)
+# Wix ships most images as <wix-image data-image-info='{"imageData":
+# {"uri": ...}}'><img></wix-image>, with no src on the <img> - its runtime
+# JS reads the JSON and fills src in. That JS is stripped here, so the
+# build does the same substitution statically; without it those images
+# never load at all.
+DATA_IMAGE_INFO_RE = re.compile(r'data-image-info="([^"]*)"', re.IGNORECASE)
+WIX_IMAGE_WRAPPER_RE = re.compile(
+    # Post pages wrap some images in <div data-image-info> rather than the
+    # <wix-image> custom element, so match any wrapper tag.
+    r'<[a-z][a-z0-9-]*\b[^>]*?data-image-info="(?P<info>[^"]*)"[^>]*?>\s*<img\b'
+    r'(?P<attrs>[^>]*?)(?P<close>/?>)',
+    re.IGNORECASE,
+)
+
+
+def media_ref_from_uri(uri):
+    """Split a Wix media uri into the (id, extension) this build stores."""
+    uri = uri.strip()
+    if not uri:
+        return None, None
+    m = re.match(r"^(?P<id>.+?)(?:~mv2|%7[Ee]mv2).*?\.(?P<ext>[A-Za-z0-9]+)$", uri)
+    if not m:
+        m = re.match(r"^(?P<id>.+)\.(?P<ext>[A-Za-z0-9]+)$", uri)
+    if not m:
+        return None, None
+    return m.group("id"), m.group("ext").lower()
+
+
+def discover_data_images(html_text):
+    """{media_id: ext} for every <wix-image> on the page."""
+    found = {}
+    for raw in DATA_IMAGE_INFO_RE.findall(html_text):
+        try:
+            info = json.loads(html.unescape(raw))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        uri = (info.get("imageData") or {}).get("uri") or info.get("uri")
+        if not uri:
+            continue
+        mid, ext = media_ref_from_uri(uri)
+        if mid:
+            found[mid] = ext
+    return found
 
 
 def asset_local_name(media_id, ext):
@@ -507,6 +617,7 @@ def build():
         text = raw.decode("utf-8", errors="replace")
         page_html[key] = text
         media_manifest.update(discover_media(text))
+        media_manifest.update(discover_data_images(text))
         for m in FILESUSR_RE.finditer(text):
             filesusr_seen.add(m.group(0))
         for m in WIX_DOC_RE.finditer(text):
@@ -575,6 +686,10 @@ def build():
         text = SCRIPT_TAG_RE.sub("", text)
         text = SCRIPT_SELF_CLOSE_RE.sub("", text)
         text = NOSCRIPT_RE.sub("", text)
+        text = PRELOAD_SCRIPT_RE.sub("", text)
+        text = BASE_TAG_RE.sub("", text)
+        text = hydrate_body_tag(text)
+        text = reveal_page_containers(text)
         text = LEGACY_CONTACT_EMAIL_RE.sub(CONTACT_EMAIL, text)
 
         # Rewrite wixstatic media references (all resize variants) to the
@@ -589,6 +704,29 @@ def build():
             return prefix + local
 
         text = WIX_MEDIA_RE.sub(_media_sub, text)
+
+        # Do statically what Wix's (stripped) JS did at runtime: give each
+        # <wix-image>'s inner <img> the src from its data-image-info JSON.
+        def _wix_image_sub(m, key=key):
+            full = m.group(0)
+            if re.search(r'\bsrc\s*=', m.group("attrs"), re.IGNORECASE):
+                return full
+            try:
+                info = json.loads(html.unescape(m.group("info")))
+            except (json.JSONDecodeError, TypeError):
+                return full
+            uri = (info.get("imageData") or {}).get("uri") or info.get("uri")
+            if not uri:
+                return full
+            mid, _ = media_ref_from_uri(uri)
+            if mid not in downloaded_media:
+                return full
+            local = asset_local_name(mid, downloaded_media[mid])
+            src = "../" * page_out_path(key).count("/") + local
+            return full[:-len(m.group("close"))] + \
+                f' src="{src}" loading="lazy"' + m.group("close")
+
+        text = WIX_IMAGE_WRAPPER_RE.sub(_wix_image_sub, text)
 
         def _doc_sub(m, key=key):
             doc_id = m.group(1)
@@ -612,35 +750,31 @@ def build():
         #   2. captured by Wayback but not mirrored -> its Wayback capture
         #   3. neither -> nearest kept ancestor page
         def _link_sub(m, key=key):
-            full = m.group(0)
-            quote_char = full[0]
-            href = m.group(2)
-            href = re.sub(r"^https?://web\.archive\.org/web/\d+[a-z_]*/", "", href)
+            full, pre, q = m.group(0), m.group("pre"), m.group("q")
+            href = re.sub(r"^https?://web\.archive\.org/web/\d+[a-z_]*/", "",
+                          m.group("url"))
             parsed = urlsplit(href)
             if parsed.netloc and parsed.netloc.lower() not in (
                 CANONICAL_HOST, DOMAIN, "www." + DOMAIN,
             ):
                 return full  # external link, leave alone
+            if not parsed.netloc and not href.startswith("/"):
+                # Already relative (media/document rewrites run before this),
+                # or a fragment, mailto:, data: URI - all fine as they are.
+                return full
             path = normalize_path(parsed.path)
             target_key = classify_path(path)
             if target_key and target_key in page_html:
-                rel = rel_path_between(key, target_key)
-                return quote_char + rel + quote_char
+                return pre + q + rel_path_between(key, target_key) + q
             captured = any_capture.get(path)
             if captured:
-                return (quote_char
+                return (pre + q
                         + f"https://web.archive.org/web/{captured['timestamp']}/"
-                        + captured["original"] + quote_char)
+                        + captured["original"] + q)
             fallback = nearest_kept_ancestor(path, page_html)
-            return quote_char + rel_path_between(key, fallback) + quote_char
+            return pre + q + rel_path_between(key, fallback) + q
 
-        text = re.sub(
-            r'(["\'])((?:https?://(?:www\.)?theverticaladventurer\.com|'
-            r'https?://web\.archive\.org/web/\d+[a-z_]*/https?://(?:www\.)?'
-            r'theverticaladventurer\.com|/)[^"\']*)\1'.replace("\\1", "\\1"),
-            lambda m: _link_sub(m),
-            text,
-        )
+        text = LINK_ATTR_RE.sub(_link_sub, text)
 
         banner = (
             f'<div style="background:#222;color:#eee;font:13px/1.5 -apple-system,'
@@ -819,8 +953,10 @@ def write_headers_file():
         # point at Wix's (still-operating) CDN instead of a local copy.
         "img-src 'self' data: https://static.wixstatic.com; "
         "style-src 'self' 'unsafe-inline'; "
+        # static.wixstatic.com/ufonts/ serves the site's custom uploaded
+        # fonts; without it headings fall back to a generic serif.
         "font-src 'self' data: https://static.parastorage.com "
-        "https://fonts.gstatic.com; "
+        "https://fonts.gstatic.com https://static.wixstatic.com; "
         "frame-src https://www.google.com https://www.youtube.com "
         "https://www.youtube-nocookie.com; "
         "base-uri 'none'; "
