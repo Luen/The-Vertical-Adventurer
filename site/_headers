@@ -3,3 +3,6 @@
   X-Frame-Options: SAMEORIGIN
   Referrer-Policy: strict-origin-when-cross-origin
   Content-Security-Policy: default-src 'none'; img-src 'self' data: https://static.wixstatic.com; style-src 'self' 'unsafe-inline'; font-src 'self' data: https://static.parastorage.com https://fonts.gstatic.com; frame-src https://www.google.com https://www.youtube.com https://www.youtube-nocookie.com; base-uri 'none'; form-action 'none'
+
+/blog/tags/*
+  X-Robots-Tag: noindex, follow

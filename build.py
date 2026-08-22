@@ -24,12 +24,13 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import html
 import urllib.request
 import urllib.error
-from urllib.parse import urlparse, urlsplit, urlunsplit, quote
+from urllib.parse import urlparse, urlsplit, urlunsplit, quote, unquote
 from datetime import datetime, timezone
 
 DOMAIN = "theverticaladventurer.com"
@@ -38,6 +39,33 @@ SITE_ORIGIN = "https://theverticaladventurer.com"
 CDX_API = "http://web.archive.org/cdx/search/cdx"
 OUT_DIR = "site"
 CACHE_DIR = ".cache"
+# Files supplied by the author rather than recovered from the Wayback
+# Machine, committed to the repo and copied into the build. Currently the
+# free PDF book, which the original site delivered by email after a signup
+# form, so no crawler ever captured it.
+LOCAL_ASSETS_DIR = "assets-local"
+# The contact form posted to Wix's (now gone) backend. Worse, it carried
+# no action/method, so a live submission would GET the visitor's name and
+# email into the URL query string - and its textarea had no name, so the
+# message itself was never included. It's replaced with a plain address.
+CONTACT_PAGE = "/contact"
+CONTACT_EMAIL = "hello@theverticaladventurer.com"
+# The original author's personal address, which appears in the archived
+# privacy policy and terms of use (as text and in mailto: links). Rewritten
+# to the domain address everywhere so the archive never points at an inbox
+# that is no longer the right contact.
+LEGACY_CONTACT_EMAIL_RE = re.compile(
+    r"theverticaladventurer@gmail\.com", re.IGNORECASE
+)
+PDF_BOOK_PAGE = "/get-outdoors-and-start-adventures"
+# (filename, link label) for the downloads this page originally promised.
+# The checklists were a further Google Drive link from inside the book.
+PDF_BOOK_DOWNLOADS = [
+    ("get-outdoors-say-yes-to-adventure.pdf",
+     "Get Outdoors &amp; Say Yes to Adventure! (PDF book, 19&nbsp;MB)"),
+    ("hiking-gear-packing-checklists.pdf",
+     "Printable hiking gear checklists (day &amp; overnight, 0.7&nbsp;MB)"),
+]
 USER_AGENT = (
     "Mozilla/5.0 (compatible; VerticalAdventurerArchiveBot/1.0; "
     "+https://github.com/Luen/The-Vertical-Adventurer; archival mirror build)"
@@ -61,6 +89,17 @@ FIXED_PAGES = {
 }
 BLOG_LISTING_RE = re.compile(r"^/blog(/page/\d+)?$")
 BLOG_CATEGORY_RE = re.compile(r"^/blog/categories/[a-z0-9\-]+(/page/\d+)?$")
+# Tag listings are mirrored so tag links keep visitors on the domain, but
+# only in the site's final URL scheme: the two earlier schemes
+# (/blog/tag/<Slug>, /blog/search/.hash.<Tag>) list the same posts and are
+# redirected here instead of stored again. They're also kept out of the
+# sitemap and marked noindex - 75 re-slices of posts that already appear
+# on the category pages is exactly the thin, duplicated content that
+# search engines discount, and the posts themselves should rank instead.
+BLOG_TAG_RE = re.compile(r"^/blog/tags/[a-z0-9\-]+(/page/\d+)?$")
+LEGACY_TAG_RE = re.compile(
+    r"^/blog/(?:tag/(?P<a>[^/]+)|search/\.hash\.(?P<b>[^/]+))(?:/page/\d+)?$"
+)
 SINGLE_POST_RE = re.compile(r"^/single-post/([^/]+)$")
 # single-post/<hash>~mv2....jpg style entries are mis-resolved image URLs
 # from the old site, not real pages - keep the underlying image, not the page.
@@ -129,6 +168,42 @@ def _parse_cdx_bytes(data):
     return [dict(zip(header, r)) for r in body]
 
 
+_negative_cache = None
+
+
+def _negative_cache_path():
+    return os.path.join(CACHE_DIR, "confirmed-missing.json")
+
+
+def load_negative_cache(reset=False):
+    """Keys the CDX index confirmed as having nothing archived.
+
+    Recorded only after the full retry sequence below has failed, so a
+    transient empty response never lands here - just genuine misses (e.g.
+    the ~300 images the Wayback Machine never captured). Without this,
+    every rebuild re-queries each of them four times with backoff, which
+    is by far the slowest part of a rebuild and never yields anything.
+    """
+    global _negative_cache
+    if reset:
+        _negative_cache = {}
+        _save_negative_cache()
+        return _negative_cache
+    if _negative_cache is None:
+        try:
+            with open(_negative_cache_path(), encoding="utf-8") as f:
+                _negative_cache = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            _negative_cache = {}
+    return _negative_cache
+
+
+def _save_negative_cache():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(_negative_cache_path(), "w", encoding="utf-8") as f:
+        json.dump(_negative_cache, f, indent=1, sort_keys=True)
+
+
 def cdx_query(params, empty_retries=3):
     """Query the CDX API, with caching.
 
@@ -137,12 +212,18 @@ def cdx_query(params, empty_retries=3):
     A cached empty result is therefore never trusted outright: it's
     re-verified (and the retry itself re-verified again if still empty)
     before being accepted, so a transient rate-limit blip can't
-    permanently poison the on-disk cache.
+    permanently poison the on-disk cache. Only once every retry has come
+    back empty is the miss recorded (see load_negative_cache), so later
+    rebuilds can skip it instead of paying for the retries again.
     """
     qs = "&".join(f"{k}={quote(str(v), safe='*:/')}" for k, v in params.items())
     url = f"{CDX_API}?{qs}"
     cache_key = "cdx_" + re.sub(r"\W+", "_", qs)
     cache_path = _cache_path(cache_key)
+
+    negative = load_negative_cache()
+    if cache_key in negative:
+        return []
 
     for attempt in range(empty_retries + 1):
         if os.path.exists(cache_path):
@@ -159,6 +240,9 @@ def cdx_query(params, empty_retries=3):
             os.remove(cache_path)  # don't let a possibly-transient empty persist
         if attempt < empty_retries:
             time.sleep(1.5 * (attempt + 1))
+
+    negative[cache_key] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _save_negative_cache()
     return []
 
 
@@ -178,7 +262,8 @@ def classify_path(path):
         return "/" if path == "" else path
     if path == "/home":
         return "/"
-    if BLOG_LISTING_RE.match(path) or BLOG_CATEGORY_RE.match(path):
+    if (BLOG_LISTING_RE.match(path) or BLOG_CATEGORY_RE.match(path)
+            or BLOG_TAG_RE.match(path)):
         return path
     m = SINGLE_POST_RE.match(path)
     if m:
@@ -189,7 +274,35 @@ def classify_path(path):
     return None
 
 
+def normalize_path(path):
+    path = path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    return path
+
+
+def nearest_kept_ancestor(path, kept_keys):
+    """Walk up the path until a page we actually kept is found."""
+    parts = [p for p in (path or "").split("/") if p]
+    while parts:
+        parts.pop()
+        candidate = "/" + "/".join(parts) if parts else "/"
+        key = classify_path(candidate)
+        if key and key in kept_keys:
+            return key
+    return "/"
+
+
 def discover_pages(refresh):
+    """Returns (pages, any_capture).
+
+    `pages` is the curated set of pages this build mirrors locally.
+    `any_capture` covers every URL the Wayback Machine captured at all
+    (regardless of our curation rules) so that links to deliberately
+    excluded content (tag pages, old URL schemes, pagination pages beyond
+    what we kept) can be pointed at their Wayback capture instead of a
+    dead link back to the live domain, which would 404.
+    """
     cache_file = os.path.join(CACHE_DIR, "cdx_domain.json")
     if refresh and os.path.exists(cache_file):
         os.remove(cache_file)
@@ -206,7 +319,8 @@ def discover_pages(refresh):
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(rows, f)
 
-    groups = {}  # group_key -> list of candidate rows
+    kept_groups = {}     # classified key -> candidate rows
+    any_groups = {}      # raw normalized path -> candidate rows
     for r in rows:
         if r.get("statuscode") != "200":
             continue
@@ -217,16 +331,16 @@ def discover_pages(refresh):
         if length < 500:
             continue  # too small to be a real rendered page
         u = urlsplit(r["original"])
+        any_groups.setdefault(normalize_path(u.path), []).append(r)
         key = classify_path(u.path)
-        if key is None:
-            continue
-        groups.setdefault(key, []).append(r)
+        if key is not None:
+            kept_groups.setdefault(key, []).append(r)
 
-    pages = {}
-    for key, candidates in groups.items():
-        best = max(candidates, key=lambda r: int(r.get("length", 0)))
-        pages[key] = best
-    return pages
+    def _best(groups):
+        return {k: max(v, key=lambda r: int(r.get("length", 0)))
+                for k, v in groups.items()}
+
+    return _best(kept_groups), _best(any_groups)
 
 
 def find_robots_and_favicon():
@@ -259,6 +373,13 @@ WIX_MEDIA_RE = re.compile(
 )
 FILESUSR_RE = re.compile(
     r"https?://www-theverticaladventurer-com\.filesusr\.com/[^\"'\s)]+",
+)
+# Documents (PDF checklists/guides) the author uploaded to Wix and linked
+# from blog posts. Served from Wix's document CDN rather than the media
+# CDN, so they need handling separate from images.
+WIX_DOC_RE = re.compile(
+    r"https?://(?:docs|static)\.wixstatic\.com/ugd/"
+    r"([A-Za-z0-9_]+)\.([A-Za-z0-9]{2,5})",
 )
 SCRIPT_TAG_RE = re.compile(r"<script\b[^>]*>.*?</script>", re.IGNORECASE | re.DOTALL)
 SCRIPT_SELF_CLOSE_RE = re.compile(r"<script\b[^>]*/>", re.IGNORECASE)
@@ -312,6 +433,20 @@ def fetch_filesusr(url):
     )
 
 
+def fetch_wix_doc(doc_id, ext):
+    rows = cdx_query({
+        "url": f"docs.wixstatic.com/ugd/{doc_id}.{ext}", "output": "json",
+    })
+    ok = [r for r in rows if r.get("statuscode") == "200"]
+    if not ok:
+        return None
+    best = max(ok, key=lambda r: int(r.get("length", 0)))
+    return fetch(
+        wayback_raw_url(best["timestamp"], best["original"]),
+        cache_key=f"doc_{doc_id}",
+    )
+
+
 def page_out_path(key):
     if key == "/":
         return "index.html"
@@ -330,10 +465,20 @@ def build():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--refresh-cdx", action="store_true")
+    ap.add_argument(
+        "--recheck-missing", action="store_true",
+        help="Forget which assets were confirmed missing and look for them "
+             "again. The Wayback Machine does pick up new captures over "
+             "time, so this is worth running occasionally - it just makes "
+             "that one build slow again.",
+    )
     args = ap.parse_args()
+    if args.recheck_missing:
+        load_negative_cache(reset=True)
+        log("Cleared the confirmed-missing list; re-checking every asset.")
 
     log(f"Discovering pages for {DOMAIN} from the Wayback CDX index...")
-    pages = discover_pages(refresh=args.refresh_cdx)
+    pages, any_capture = discover_pages(refresh=args.refresh_cdx)
     robots_row, favicon_row = find_robots_and_favicon()
     log(f"Keeping {len(pages)} pages (junk/parking-era captures excluded).")
 
@@ -346,6 +491,7 @@ def build():
     os.makedirs(OUT_DIR, exist_ok=True)
     media_manifest = {}  # media_id -> ext
     filesusr_seen = set()
+    doc_manifest = {}    # doc_id -> ext
     page_html = {}       # key -> raw html text
     page_meta = {}        # key -> dict(title, description, timestamp)
 
@@ -363,6 +509,8 @@ def build():
         media_manifest.update(discover_media(text))
         for m in FILESUSR_RE.finditer(text):
             filesusr_seen.add(m.group(0))
+        for m in WIX_DOC_RE.finditer(text):
+            doc_manifest[m.group(1)] = m.group(2).lower()
         title_m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
         desc_m = re.search(
             r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
@@ -407,12 +555,27 @@ def build():
             f.write(data)
         filesusr_local[url] = rel
 
+    log("Downloading linked documents (PDF guides/checklists)...")
+    downloaded_docs = {}
+    for doc_id, ext in sorted(doc_manifest.items()):
+        data = fetch_wix_doc(doc_id, ext)
+        if not data:
+            log(f"  ! {doc_id}.{ext} not archived, leaving link as-is")
+            continue
+        downloaded_docs[doc_id] = ext
+        out_path = os.path.join(OUT_DIR, f"assets/files/{doc_id}.{ext}")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(data)
+    log(f"Saved {len(downloaded_docs)}/{len(doc_manifest)} documents.")
+
     log("Rewriting HTML (internal links + image references)...")
     for key, text in page_html.items():
         text = WAYBACK_BANNER_RE.sub("", text)
         text = SCRIPT_TAG_RE.sub("", text)
         text = SCRIPT_SELF_CLOSE_RE.sub("", text)
         text = NOSCRIPT_RE.sub("", text)
+        text = LEGACY_CONTACT_EMAIL_RE.sub(CONTACT_EMAIL, text)
 
         # Rewrite wixstatic media references (all resize variants) to the
         # single locally-saved original file.
@@ -427,13 +590,27 @@ def build():
 
         text = WIX_MEDIA_RE.sub(_media_sub, text)
 
+        def _doc_sub(m, key=key):
+            doc_id = m.group(1)
+            if doc_id not in downloaded_docs:
+                return m.group(0)
+            depth = page_out_path(key).count("/")
+            return ("../" * depth
+                    + f"assets/files/{doc_id}.{downloaded_docs[doc_id]}")
+
+        text = WIX_DOC_RE.sub(_doc_sub, text)
+
         for url, rel in filesusr_local.items():
             depth = page_out_path(key).count("/")
             text = text.replace(url, "../" * depth + rel)
 
-        # Rewrite internal links (both raw and any leftover /web/<ts>/ forms)
-        # to relative local paths for pages we kept; leave everything else
-        # (external sites, images already handled above) untouched.
+        # Rewrite internal links (both raw and any leftover /web/<ts>/ forms).
+        # An internal link must never be left pointing at the live domain:
+        # this archive only hosts a curated subset, so anything else would
+        # 404 once deployed. Resolution order:
+        #   1. mirrored locally -> relative path
+        #   2. captured by Wayback but not mirrored -> its Wayback capture
+        #   3. neither -> nearest kept ancestor page
         def _link_sub(m, key=key):
             full = m.group(0)
             quote_char = full[0]
@@ -444,12 +621,18 @@ def build():
                 CANONICAL_HOST, DOMAIN, "www." + DOMAIN,
             ):
                 return full  # external link, leave alone
-            path = parsed.path or "/"
+            path = normalize_path(parsed.path)
             target_key = classify_path(path)
             if target_key and target_key in page_html:
                 rel = rel_path_between(key, target_key)
                 return quote_char + rel + quote_char
-            return full
+            captured = any_capture.get(path)
+            if captured:
+                return (quote_char
+                        + f"https://web.archive.org/web/{captured['timestamp']}/"
+                        + captured["original"] + quote_char)
+            fallback = nearest_kept_ancestor(path, page_html)
+            return quote_char + rel_path_between(key, fallback) + quote_char
 
         text = re.sub(
             r'(["\'])((?:https?://(?:www\.)?theverticaladventurer\.com|'
@@ -471,6 +654,34 @@ def build():
         )
         text = re.sub(r"(<body[^>]*>)", r"\1" + banner, text, count=1, flags=re.I)
 
+        if key == CONTACT_PAGE:
+            text = replace_contact_form(text)
+
+        # These were the reward for a signup form that posted to Wix's
+        # (now gone) backend, so the page's own call to action is dead.
+        # Offer the files directly instead.
+        if key == PDF_BOOK_PAGE:
+            depth = page_out_path(key).count("/")
+            available = [
+                (fn, label) for fn, label in PDF_BOOK_DOWNLOADS
+                if os.path.exists(os.path.join(LOCAL_ASSETS_DIR, fn))
+            ]
+            if available:
+                links = " &nbsp;·&nbsp; ".join(
+                    f'<a href="{"../" * depth}assets/files/{fn}" download '
+                    f'style="color:#1a1a1a;font-weight:700">{label}</a>'
+                    for fn, label in available
+                )
+                callout = (
+                    '<div style="background:#f7941e;color:#1a1a1a;'
+                    'font:15px/1.6 -apple-system,sans-serif;text-align:center;'
+                    'padding:14px 12px">The email signup that used to deliver '
+                    'these no longer works &mdash; download them directly:<br>'
+                    + links + '</div>'
+                )
+                text = re.sub(r"(<body[^>]*>)", r"\1" + callout, text,
+                              count=1, flags=re.I)
+
         out_path = os.path.join(OUT_DIR, page_out_path(key))
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
@@ -488,10 +699,98 @@ def build():
             with open(os.path.join(OUT_DIR, "favicon.ico"), "wb") as f:
                 f.write(data)
 
+    copy_local_assets()
+    write_redirects(pages, any_capture)
     write_sitemap(pages, page_meta)
     write_llms_txt(pages, page_meta)
     write_headers_file()
     log("Done. Output written to ./site")
+
+
+def replace_contact_form(text):
+    """Swap the dead contact form for the address, in place."""
+    start = text.find("<form")
+    if start == -1:
+        return text
+    end = text.find("</form>", start)
+    if end == -1:
+        return text
+    end += len("</form>")
+    replacement = (
+        '<div style="font:16px/1.7 -apple-system,sans-serif;color:#2b2b2b;'
+        'max-width:600px;margin:0 auto;padding:22px 18px;text-align:center;'
+        'border:1px solid #e0e0e0;border-radius:4px;background:#fafafa">'
+        'This is a historical archive, so the original contact form no '
+        'longer works.<br><br>To get in touch, email '
+        f'<a href="mailto:{CONTACT_EMAIL}" style="color:#c1720d;'
+        f'font-weight:700">{CONTACT_EMAIL}</a></div>'
+    )
+    return text[:start] + replacement + text[end:]
+
+
+def write_redirects(pages, any_capture):
+    """Cloudflare Pages reads a _redirects file at the site root natively.
+
+    The original site served the same post under several URL spellings -
+    notably mixed-case slugs (/single-post/Summit-Fever-and-How-to-Avoid-It)
+    alongside lowercase ones. This archive stores one lowercase copy of
+    each, and static hosting is case-sensitive, so every old spelling would
+    404. That matters beyond old inbound links and search results: the
+    author's PDF book links to the mixed-case spellings throughout.
+    """
+    seen = {}
+    for path in any_capture:
+        key = classify_path(path)
+        if not key or key not in pages:
+            continue
+        canonical = "/" if key == "/" else key + "/"
+        if normalize_path(path) == normalize_path(canonical):
+            continue
+        seen[path] = canonical
+
+    # The site's two earlier tag URL schemes list the same posts as the
+    # mirrored current scheme, so they redirect there rather than being
+    # stored again. Their slugs need normalising: /blog/tag/Skills-%26-Advice
+    # is /blog/tags/skills-26-advice today.
+    for path in any_capture:
+        m = LEGACY_TAG_RE.match(normalize_path(path))
+        if not m:
+            continue
+        slug = unquote(m.group("a") or m.group("b")).lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", slug.replace("&", "26")).strip("-")
+        target = f"/blog/tags/{slug}"
+        if target in pages:
+            seen.setdefault(normalize_path(path), target + "/")
+
+    # A typo baked into the PDF book itself (missing hyphen), so it was
+    # broken on the original site too - worth catching here.
+    for path, key in list(seen.items()):
+        if path.startswith("/single-post/"):
+            seen.setdefault(path.replace("/single-post/", "/singlepost/", 1), key)
+    for key in pages:
+        if key.startswith("/single-post/"):
+            seen.setdefault(key.replace("/single-post/", "/singlepost/", 1),
+                            key + "/")
+
+    lines = [f"{src}  {dst}  301" for src, dst in sorted(seen.items())]
+    with open(os.path.join(OUT_DIR, "_redirects"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    log(f"Wrote {len(lines)} redirects for legacy URL spellings.")
+
+
+def copy_local_assets():
+    """Copy author-supplied files (see LOCAL_ASSETS_DIR) into the build."""
+    if not os.path.isdir(LOCAL_ASSETS_DIR):
+        return
+    dest_dir = os.path.join(OUT_DIR, "assets", "files")
+    os.makedirs(dest_dir, exist_ok=True)
+    copied = 0
+    for name in sorted(os.listdir(LOCAL_ASSETS_DIR)):
+        src = os.path.join(LOCAL_ASSETS_DIR, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dest_dir, name))
+            copied += 1
+    log(f"Copied {copied} author-supplied asset(s) from {LOCAL_ASSETS_DIR}/.")
 
 
 def write_robots(pages):
@@ -533,6 +832,11 @@ def write_headers_file():
         "  X-Frame-Options: SAMEORIGIN",
         "  Referrer-Policy: strict-origin-when-cross-origin",
         f"  Content-Security-Policy: {csp}",
+        "",
+        # Mirrored so tag links stay on the domain, but kept out of search
+        # results - they re-slice posts that already rank on their own.
+        "/blog/tags/*",
+        "  X-Robots-Tag: noindex, follow",
     ]
     with open(os.path.join(OUT_DIR, "_headers"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -542,6 +846,8 @@ def write_sitemap(pages, page_meta):
     lines = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
     for key in sorted(pages):
+        if BLOG_TAG_RE.match(key):
+            continue  # noindex - see BLOG_TAG_RE
         ts = page_meta[key]["timestamp"]
         lastmod = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
         loc = SITE_ORIGIN + ("/" if key == "/" else key + "/")
@@ -556,7 +862,10 @@ def write_sitemap(pages, page_meta):
 
 def write_llms_txt(pages, page_meta):
     posts = sorted(k for k in pages if k.startswith("/single-post/"))
-    site_pages = sorted(k for k in pages if k not in posts and k != "/")
+    site_pages = sorted(
+        k for k in pages
+        if k not in posts and k != "/" and not BLOG_TAG_RE.match(k)
+    )
 
     def entry(key):
         title = page_meta[key]["title"]
