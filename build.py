@@ -30,7 +30,7 @@ import time
 import html
 import urllib.request
 import urllib.error
-from urllib.parse import urlparse, urlsplit, urlunsplit, quote
+from urllib.parse import urlparse, urlsplit, urlunsplit, quote, unquote
 from datetime import datetime, timezone
 
 DOMAIN = "theverticaladventurer.com"
@@ -89,6 +89,17 @@ FIXED_PAGES = {
 }
 BLOG_LISTING_RE = re.compile(r"^/blog(/page/\d+)?$")
 BLOG_CATEGORY_RE = re.compile(r"^/blog/categories/[a-z0-9\-]+(/page/\d+)?$")
+# Tag listings are mirrored so tag links keep visitors on the domain, but
+# only in the site's final URL scheme: the two earlier schemes
+# (/blog/tag/<Slug>, /blog/search/.hash.<Tag>) list the same posts and are
+# redirected here instead of stored again. They're also kept out of the
+# sitemap and marked noindex - 75 re-slices of posts that already appear
+# on the category pages is exactly the thin, duplicated content that
+# search engines discount, and the posts themselves should rank instead.
+BLOG_TAG_RE = re.compile(r"^/blog/tags/[a-z0-9\-]+(/page/\d+)?$")
+LEGACY_TAG_RE = re.compile(
+    r"^/blog/(?:tag/(?P<a>[^/]+)|search/\.hash\.(?P<b>[^/]+))(?:/page/\d+)?$"
+)
 SINGLE_POST_RE = re.compile(r"^/single-post/([^/]+)$")
 # single-post/<hash>~mv2....jpg style entries are mis-resolved image URLs
 # from the old site, not real pages - keep the underlying image, not the page.
@@ -251,7 +262,8 @@ def classify_path(path):
         return "/" if path == "" else path
     if path == "/home":
         return "/"
-    if BLOG_LISTING_RE.match(path) or BLOG_CATEGORY_RE.match(path):
+    if (BLOG_LISTING_RE.match(path) or BLOG_CATEGORY_RE.match(path)
+            or BLOG_TAG_RE.match(path)):
         return path
     m = SINGLE_POST_RE.match(path)
     if m:
@@ -736,6 +748,20 @@ def write_redirects(pages, any_capture):
             continue
         seen[path] = canonical
 
+    # The site's two earlier tag URL schemes list the same posts as the
+    # mirrored current scheme, so they redirect there rather than being
+    # stored again. Their slugs need normalising: /blog/tag/Skills-%26-Advice
+    # is /blog/tags/skills-26-advice today.
+    for path in any_capture:
+        m = LEGACY_TAG_RE.match(normalize_path(path))
+        if not m:
+            continue
+        slug = unquote(m.group("a") or m.group("b")).lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", slug.replace("&", "26")).strip("-")
+        target = f"/blog/tags/{slug}"
+        if target in pages:
+            seen.setdefault(normalize_path(path), target + "/")
+
     # A typo baked into the PDF book itself (missing hyphen), so it was
     # broken on the original site too - worth catching here.
     for path, key in list(seen.items()):
@@ -806,6 +832,11 @@ def write_headers_file():
         "  X-Frame-Options: SAMEORIGIN",
         "  Referrer-Policy: strict-origin-when-cross-origin",
         f"  Content-Security-Policy: {csp}",
+        "",
+        # Mirrored so tag links stay on the domain, but kept out of search
+        # results - they re-slice posts that already rank on their own.
+        "/blog/tags/*",
+        "  X-Robots-Tag: noindex, follow",
     ]
     with open(os.path.join(OUT_DIR, "_headers"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -815,6 +846,8 @@ def write_sitemap(pages, page_meta):
     lines = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
     for key in sorted(pages):
+        if BLOG_TAG_RE.match(key):
+            continue  # noindex - see BLOG_TAG_RE
         ts = page_meta[key]["timestamp"]
         lastmod = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
         loc = SITE_ORIGIN + ("/" if key == "/" else key + "/")
@@ -829,7 +862,10 @@ def write_sitemap(pages, page_meta):
 
 def write_llms_txt(pages, page_meta):
     posts = sorted(k for k in pages if k.startswith("/single-post/"))
-    site_pages = sorted(k for k in pages if k not in posts and k != "/")
+    site_pages = sorted(
+        k for k in pages
+        if k not in posts and k != "/" and not BLOG_TAG_RE.match(k)
+    )
 
     def entry(key):
         title = page_meta[key]["title"]
